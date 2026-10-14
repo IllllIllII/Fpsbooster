@@ -1,5 +1,5 @@
 // =====================================================================
-//  Frame Booster v3.1.2 - 공통 (헤더, 상수, 디자인 토큰, 전역, 설정)
+//  Frame Booster v3.1.5 - 공통 (헤더, 상수, 디자인 토큰, 전역, 설정)
 // =====================================================================
 #ifndef UNICODE
 #define UNICODE
@@ -44,7 +44,7 @@
 //  상수
 // ---------------------------------------------------------------------
 static const wchar_t* APP_NAME  = L"Frame Booster";
-static const wchar_t* APP_VER   = L"v3.1.2";
+static const wchar_t* APP_VER   = L"v3.1.5";
 static const wchar_t* WND_CLASS = L"FrameBoosterMainWnd";
 static const wchar_t* OVL_CLASS = L"FrameBoosterOverlay";
 static const wchar_t* RUN_KEY   = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -141,6 +141,8 @@ struct AppInfo {
     int count = 0;
     unsigned long long memMB = 0;
     bool hasWindow = false;
+    bool helper = false;      // 다른 앱이 띄운 창 없는 보조 프로그램 (크롬 확장 연결, 충돌 보고 등)
+    std::wstring parent;      // 띄운 앱 이름
 };
 struct SavedApp { std::wstring name, display, path, args; };
 struct ProcEntry { DWORD pid, ppid; std::wstring name; };

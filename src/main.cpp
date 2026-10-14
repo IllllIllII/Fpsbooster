@@ -11,6 +11,7 @@
 #include "tray.inc"
 #include "overlay.inc"
 #include "ui_main.inc"
+#include "report.inc"
 #include "ui_analysis.inc"
 #include "ui_settings.inc"
 
@@ -20,6 +21,7 @@
 static void UpdateEditVisibility() {
     bool show = g_page == PAGE_SETTINGS && g_modal == MODAL_NONE && IsWindowVisible(g_hwnd);
     ShowWindow(g_edit, show ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_repEdit, g_modal == MODAL_REPORT && IsWindowVisible(g_hwnd) ? SW_SHOW : SW_HIDE);
 }
 
 static void RefreshList() { g_apps = GetAppList(); Redraw(); }
@@ -236,6 +238,11 @@ static void OnClick(int id) {
         }
         return;
     }
+    if (g_modal == MODAL_REPORT) {
+        if (id == H_REP_SEND) StartReportSend();
+        else if ((id == H_REP_CANCEL || id == H_MODAL_BG) && g_repState != REP_SENDING) SetModal(MODAL_NONE);
+        return;
+    }
     if (g_modal == MODAL_LOG) {
         if (id == H_LOG_CLOSE || id == H_MODAL_BG) SetModal(MODAL_NONE);
         else if (id == H_LOG_CLEAR) { g_logs.clear(); g_logScroll = 0; Redraw(); }
@@ -325,6 +332,16 @@ static void OnClick(int id) {
     case H_UPD_BADGE: OpenUpdateModal(); break;
     case H_OPEN_FOLDER: ShellExecuteW(g_hwnd, L"open", g_dataDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
     case H_OPEN_LOG: g_logScroll = 0; SetModal(MODAL_LOG); break;
+    case H_REP_OPEN:
+        if (!ReportAvailable()) break;
+        RefreshPowerState(); RefreshTweakState();
+        g_repText = BuildReport();
+        g_repScroll = 0;
+        if (g_repState != REP_SENDING) { g_repState = REP_IDLE; g_repCode = 0; }
+        SetWindowTextW(g_repEdit, L"");
+        SetModal(MODAL_REPORT);
+        SetFocus(g_repEdit);
+        break;
     }
 }
 
@@ -372,6 +389,7 @@ static void OnPaint(HWND h) {
     if (g_modal == MODAL_CONFIRM) DrawConfirmModal();
     else if (g_modal == MODAL_UPDATE) DrawUpdateModal();
     else if (g_modal == MODAL_LOG) DrawLogModal();
+    else if (g_modal == MODAL_REPORT) DrawReportModal();
     if (g_rt->EndDraw() == (HRESULT)D2DERR_RECREATE_TARGET) DiscardMainTarget();
 }
 
@@ -385,6 +403,11 @@ static void Layout() {
     g_editFont = CreateFontIndirectW(&lf);
     SendMessageW(g_edit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
     MoveWindow(g_edit, S(278), S(390), S(382), S(22), TRUE);
+    SendMessageW(g_repEdit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
+    {   // 문제 보고 메모칸 (팝업 안의 입력 상자 위치)
+        float rx = (BASE_W - RP_W) / 2, ry = (BASE_H - RP_H) / 2;
+        MoveWindow(g_repEdit, S(rx + 40), S(ry + 121), S(RP_W - 80), S(22), TRUE);
+    }
     if (g_rt) g_rt->SetDpi(96.f * g_scale, 96.f * g_scale);
     Redraw();
 }
@@ -436,6 +459,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         g_hwnd = h;
         g_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP, 0, 0, 10, 10, h, (HMENU)(INT_PTR)IDC_EDIT, g_inst, nullptr);
+        g_repEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP, 0, 0, 10, 10, h, (HMENU)(INT_PTR)(IDC_EDIT + 1), g_inst, nullptr);
+        SendMessageW(g_repEdit, EM_LIMITTEXT, 500, 0);
+        SendMessageW(g_repEdit, 0x1501 /*EM_SETCUEBANNER*/, TRUE, (LPARAM)L"예: 측정이 안 돼요 / 부스트 후 프로그램이 안 켜져요");
         return 0;
     case WM_DPICHANGED:
         g_dpi = HIWORD(wp);
@@ -501,6 +527,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         float x = pt.x / g_scale, y = pt.y / g_scale;
         float d = -(float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
         if (g_modal == MODAL_LOG) { g_logScroll = std::max(0.f, g_logScroll - d * 72); Redraw(); return 0; }
+        if (g_modal == MODAL_REPORT) {
+            float lines = 1;
+            for (wchar_t c : g_repText) if (c == L'\n') lines++;
+            float maxs = std::max(0.f, lines * 17.f - (RP_H - 262) + 40);
+            g_repScroll = std::max(0.f, std::min(g_repScroll + d * 68, maxs)); Redraw(); return 0;
+        }
         if (g_modal != MODAL_NONE) return 0;
         if (g_page == PAGE_BOOST && x >= AL_X && x < AL_X + AL_W && y >= AL_Y && y < AL_Y + AL_H) {
             g_listScroll = std::max(0.f, std::min(g_listScroll + d * AL_PITCH * 2, AppMaxScroll())); g_hover = 0; Redraw();
@@ -513,7 +545,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
-            if (g_modal == MODAL_CONFIRM || g_modal == MODAL_LOG) SetModal(MODAL_NONE);
+            if (g_modal == MODAL_CONFIRM || g_modal == MODAL_LOG || (g_modal == MODAL_REPORT && g_repState != REP_SENDING)) SetModal(MODAL_NONE);
             else if (g_modal == MODAL_UPDATE && g_updState != UPD_DOWNLOADING && g_updState != UPD_APPLYING) SetModal(MODAL_NONE);
             else if (g_ovlMoving) { SetOverlayMoving(false); Redraw(); }
         } else if (wp == VK_RETURN && g_modal == MODAL_CONFIRM) OnClick(H_CONF_OK);
@@ -581,6 +613,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         Redraw();
         return 0;
     }
+    case WM_APP_REPORT:
+        g_repCode = (int)wp;
+        if (wp >= 200 && wp < 300) { g_repState = REP_SENT; g_repLastSent = GetTickCount(); AddLog(L_OK, L"문제 보고 보냄"); }
+        else { g_repState = REP_FAILED; AddLog(L_ERR, L"문제 보고 실패 (코드 " + std::to_wstring((int)wp) + L")"); }
+        Redraw();
+        return 0;
     case WM_APP_TOOL:
         g_toolState = wp == 1 ? TOOL_READY : TOOL_FAILED;
         AddLog(wp == 1 ? L_OK : L_ERR, wp == 1 ? L"측정 도구 준비 완료" : L"측정 도구를 받지 못했어요 (인터넷 확인)");

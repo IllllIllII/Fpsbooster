@@ -24,6 +24,52 @@ static bool IsSystemName(const std::wstring& n) {
     return false;
 }
 
+// 콘솔(명령 창) 프로그램인지 - 이런 보조 프로그램을 혼자 다시 켜면 빈 터미널 창이 뜸
+static bool IsConsoleExe(const std::wstring& path) {
+    static std::map<std::wstring, bool> cache;
+    auto it = cache.find(Lower(path));
+    if (it != cache.end()) return it->second;
+    bool con = false;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        static BYTE b[4096];
+        DWORD rd = 0;
+        if (ReadFile(f, b, sizeof(b), &rd, nullptr) && rd >= 0x40 && b[0] == 'M' && b[1] == 'Z') {
+            DWORD pe = 0; memcpy(&pe, b + 0x3C, 4);
+            if (pe + 24 + 70 <= rd && !memcmp(b + pe, "PE\0\0", 4)) {
+                WORD sub = 0; memcpy(&sub, b + pe + 24 + 68, 2);   // OptionalHeader.Subsystem (32/64비트 같은 위치)
+                con = sub == IMAGE_SUBSYSTEM_WINDOWS_CUI;
+            }
+        }
+        CloseHandle(f);
+    }
+    cache[Lower(path)] = con;
+    return con;
+}
+
+// 게임 본체 · 런처 · 안티치트: 목록에 안 보이고, 끄거나 다시 켜지 않음
+// (런처를 다시 켜면 게임이 또 실행됨 - 예: 배그 ExecPubg · TslGame_BE)
+static bool IsGameComponent(const std::wstring& name, const std::wstring& path, const std::wstring& desc) {
+    std::wstring n = Lower(name), d = Lower(desc);
+    static const wchar_t* kAntiCheat[] = { L"battleye", L"easyanticheat", L"anti-cheat", L"anticheat", L"vanguard", L"xigncode", L"nprotect" };
+    for (auto k : kAntiCheat) if (n.find(k) != std::wstring::npos || d.find(k) != std::wstring::npos) return true;
+    size_t slash = path.find_last_of(L'\\');
+    std::wstring dir = slash == std::wstring::npos ? L"" : path.substr(0, slash + 1);
+    for (auto& g : g_set.games) {
+        std::wstring lg = Lower(g);
+        if (lg.empty()) continue;
+        if (n.compare(0, lg.size(), lg) == 0) return true;                 // TslGame_BE 처럼 게임 이름으로 시작
+        if (!dir.empty() && FileExists(dir + g + L".exe")) return true;    // 게임 exe와 같은 폴더 (게임 런처)
+    }
+    return false;
+}
+
+// 이 앱들이 띄운 프로그램은 "보조 프로그램"이 아님 (사용자가 직접 켠 앱)
+static const wchar_t* kStarters[] = {
+    L"explorer", L"svchost", L"sihost", L"userinit", L"services", L"wininit", L"winlogon", L"taskhostw",
+    L"RuntimeBroker", L"cmd", L"powershell", L"pwsh", L"WindowsTerminal", L"OpenConsole", L"conhost", L"FrameBooster"
+};
+
 static bool IsRealWindow(HWND h) {
     if (!IsWindowVisible(h)) return false;
     if (GetWindow(h, GW_OWNER)) return false;
@@ -125,8 +171,11 @@ static std::vector<AppInfo> GetAppList() {
 
     struct P { DWORD pid, ppid; std::wstring name, path; SIZE_T mem; };
     std::map<std::wstring, std::vector<P>> groups;
+    auto snap = Snapshot();
+    std::map<DWORD, std::wstring> nameOf;
+    for (auto& pr : snap) nameOf[pr.pid] = pr.name;
 
-    for (auto& pr : Snapshot()) {
+    for (auto& pr : snap) {
         if (pr.pid <= 4 || pr.pid == me) continue;
         DWORD s = 0;
         if (!ProcessIdToSessionId(pr.pid, &s) || s != sess) continue;
@@ -141,6 +190,7 @@ static std::vector<AppInfo> GetAppList() {
         CloseHandle(h);
         if (!ok) continue;
         if (Lower(path).compare(0, win.size(), win) == 0) continue;
+        if (IsGameComponent(pr.name, path, FileDesc(path))) continue;
         groups[Lower(pr.name)].push_back({ pr.pid, pr.ppid, pr.name, path, mem });
     }
 
@@ -161,6 +211,14 @@ static std::vector<AppInfo> GetAppList() {
         a.memMB = (sum + 512 * 1024) / (1024 * 1024);
         a.display = FileDesc(a.path);
         if (a.display.empty()) a.display = a.name;
+        // 다른 앱이 띄운 창 없는 프로그램 = 보조 프로그램 (원래 앱이 켜질 때 같이 켜짐)
+        auto pn = nameOf.find(root->ppid);
+        if (pn != nameOf.end() && !IEq(pn->second, a.name)) {
+            bool starter = false;
+            for (auto st : kStarters) if (IEq(pn->second, st)) starter = true;
+            if (!starter) a.parent = pn->second;
+        }
+        a.helper = !a.hasWindow && (!a.parent.empty() || IsConsoleExe(a.path));
         out.push_back(a);
     }
     std::sort(out.begin(), out.end(), [](const AppInfo& x, const AppInfo& y) {
@@ -638,6 +696,12 @@ static DWORD WINAPI BoostThread(LPVOID p) {
         targets.erase(std::remove_if(targets.begin(), targets.end(),
                       [&](const AppInfo& a) { return !run0.count(Lower(a.name)); }), targets.end());
     }
+    {   // 보조 프로그램은 띄운 앱도 같이 끌 때만 끔 (띄운 앱이 계속 켜져 있으면 그 앱이 망가질 수 있음)
+        std::set<std::wstring> tn;
+        for (auto& a : targets) tn.insert(Lower(a.name));
+        targets.erase(std::remove_if(targets.begin(), targets.end(),
+                      [&](const AppInfo& a) { return a.helper && !a.parent.empty() && !tn.count(Lower(a.parent)); }), targets.end());
+    }
     if (!targets.empty()) LogFromThread(L_INFO, L"부스트 시작: 앱 " + std::to_wstring(targets.size()) + L"개 종료");
     else LogFromThread(L_INFO, L"부스트 시작 (끌 앱 없음)");
 
@@ -684,11 +748,11 @@ static DWORD WINAPI BoostThread(LPVOID p) {
             LogFromThread(L_ERR, L"× " + a.display + L" - 종료 실패 (관리자 권한 앱일 수 있음)");
             fail++;
         } else {
-            LogFromThread(L_OK, L"✓ " + a.display);
+            LogFromThread(L_OK, L"✓ " + a.display + (a.helper ? L" (보조 프로그램 - 다시 켜지 않음)" : L""));
             ok++;
             bool dup = false;
             for (auto& s : saved) if (IEq(s.name, a.name)) dup = true;
-            if (!dup) saved.push_back({ a.name, a.display, a.path, a.args });
+            if (!dup && !a.helper) saved.push_back({ a.name, a.display, a.path, a.args });
         }
     }
     SaveState(saved);
@@ -744,6 +808,8 @@ static int RestoreCore(const std::function<void(int, const std::wstring&)>& log)
     for (auto& a : list) {
         if (run.count(Lower(a.name))) { log(L_INFO, L"- " + a.display + L" (이미 실행 중)"); continue; }
         if (!FileExists(a.path)) { log(L_ERR, L"× " + a.display + L" - 파일을 찾을 수 없음"); continue; }
+        if (IsGameComponent(a.name, a.path, a.display)) { log(L_INFO, L"- " + a.display + L" (게임 런처 · 안티치트라 다시 켜지 않음)"); continue; }
+        if (IsConsoleExe(a.path)) { log(L_INFO, L"- " + a.display + L" (보조 프로그램이라 다시 켜지 않음)"); continue; }
         std::wstring dir = a.path.substr(0, a.path.find_last_of(L'\\'));
         SHELLEXECUTEINFOW sei; ZeroMemory(&sei, sizeof(sei));
         sei.cbSize = sizeof(sei);

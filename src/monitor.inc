@@ -85,33 +85,136 @@ static void StartToolDownload() {
 // ---------------------------------------------------------------------
 struct FrameStats {
     float avgFps = 0, low1 = 0, low01 = 0, avgMs = 0, maxMs = 0, durSec = 0;
-    int stutters = 0;
+    float playSec = 0;      // 통계에 쓴 시간 (로딩·메뉴 구간 뺀 실제 플레이)
+    int stutters = 0;       // 실제 플레이 중 끊김 횟수 (연달아 튄 프레임은 1회)
     size_t frames = 0;
 };
+
+// 로딩·메뉴 구간 (+ 앞뒤 1초 전환 구간은 같이 뺌)
+//  - 1초 동안의 중앙 FPS가 플레이 FPS의 30% 미만인 초 (오버워치 메뉴 60 FPS 등)
+//  - 화면이 1초 넘게 멈춘 초 (로딩·게임 종료)
+//  - 플레이보다 1.8배 이상 느리면서 FPS가 일정하게 고정된 구간이 3초 이상 (발로란트 대기 화면 144 FPS 등)
+static const float MENU_FPS_RATIO = 0.30f;
+static const float MENU_SLOW_RATIO = 1.8f;
+static const float MENU_STEADY = 0.10f;   // 1초 안의 프레임타임 흔들림(사분위 범위 / 중앙값)이 10% 미만 = FPS 제한
+static const size_t MENU_MIN_SEC = 3;
+// 끊김: 그 1초의 보통 프레임보다 2.5배 이상 길고, 12ms 이상 더 걸린 프레임 (0.1초 안에 연달아 튀면 1회)
+static const float STUTTER_RATIO = 2.5f;
+static const float STUTTER_MS = 12.f;
+static const double STUTTER_GAP_MS = 100.0;
+
+static float MedianOf(std::vector<float>& v) {
+    if (v.empty()) return 0;
+    size_t k = v.size() / 2;
+    std::nth_element(v.begin(), v.begin() + k, v.end());
+    return v[k];
+}
 
 static FrameStats ComputeStats(const float* ft, size_t n) {
     FrameStats s;
     if (n < 2) return s;
-    double sum = 0; float mx = 0;
-    for (size_t i = 0; i < n; i++) { sum += ft[i]; mx = std::max(mx, ft[i]); }
+    double sum = 0;
+    for (size_t i = 0; i < n; i++) sum += ft[i];
     s.frames = n;
     s.durSec = (float)(sum / 1000.0);
-    s.avgMs = (float)(sum / n);
-    s.avgFps = (float)(n * 1000.0 / sum);
+
+    // 1) 1초 단위로 나누고, 초마다 중앙 프레임타임
+    //    (긴 프레임은 끝난 초에 넣음 → 로딩·게임 종료 때 멈춘 프레임은 그 뒤 메뉴 구간과 같이 빠짐)
+    std::vector<size_t> secStart;
+    {
+        double acc = 0;
+        for (size_t i = 0; i < n; i++) {
+            acc += ft[i];
+            size_t sec = (size_t)(std::max(0.0, acc - 0.001) / 1000.0);
+            while (secStart.size() <= sec) secStart.push_back(i);
+        }
+        secStart.push_back(n);
+    }
+    size_t S = secStart.size() - 1;
+    std::vector<float> secMed(S, 0.f), secSpread(S, 0.f), tmp, meds;
+    for (size_t k = 0; k < S; k++) {
+        if (secStart[k + 1] <= secStart[k]) continue;
+        tmp.assign(ft + secStart[k], ft + secStart[k + 1]);
+        size_t c = tmp.size();
+        secMed[k] = MedianOf(tmp);
+        if (c >= 4 && secMed[k] > 0) {
+            std::nth_element(tmp.begin(), tmp.begin() + c / 4, tmp.end());
+            float q1 = tmp[c / 4];
+            std::nth_element(tmp.begin(), tmp.begin() + 3 * c / 4, tmp.end());
+            float q3 = tmp[3 * c / 4];
+            secSpread[k] = (q3 - q1) / secMed[k];
+        }
+        meds.push_back(secMed[k]);
+    }
+
+    // 2) 플레이 기준 프레임타임 (메뉴 구간을 빼고 한 번 더 구함)
+    auto playMedian = [&](float lim) {
+        tmp.clear();
+        for (float v : meds) if (lim <= 0 || v <= lim) tmp.push_back(v);
+        return MedianOf(tmp);
+    };
+    float pm = playMedian(0);
+    if (pm > 0) { float pm2 = playMedian(pm / MENU_FPS_RATIO); if (pm2 > 0) pm = pm2; }
+    float menuLim = pm > 0 ? pm / MENU_FPS_RATIO : 1e30f;
+    std::vector<char> menu(S, 0), steady(S, 0);
+    for (size_t k = 0; k < S; k++) {
+        bool empty = secStart[k + 1] <= secStart[k];   // 프레임이 하나도 안 끝난 초 = 1초 넘게 멈춤 (로딩·종료)
+        if (empty || secMed[k] > menuLim) menu[k] = 1;
+        if (!empty && pm > 0 && secMed[k] > pm * MENU_SLOW_RATIO && secSpread[k] < MENU_STEADY) steady[k] = 1;
+    }
+    for (size_t k = 0; k < S;) {   // 느리고 일정한 초가 3초 이상 이어지면 메뉴 (사이에 1초 끊겨도 이어진 것으로)
+        if (!steady[k]) { k++; continue; }
+        size_t j = k;
+        while (j + 1 < S && (steady[j + 1] || (j + 2 < S && steady[j + 2]))) j++;
+        if (j - k + 1 >= MENU_MIN_SEC) for (size_t q = k; q <= j; q++) menu[q] = 1;
+        k = j + 1;
+    }
+    std::vector<char> excl(S, 0);
+    for (size_t k = 0; k < S; k++) {
+        if (menu[k]) for (size_t j = (k ? k - 1 : 0); j <= k + 1 && j < S; j++) excl[j] = 1;
+    }
+
+    // 3) 실제 플레이 프레임만으로 통계 + 끊김
+    std::vector<float> v;
+    v.reserve(n);
+    double psum = 0, t = 0, lastSt = -1e18;
+    float mx = 0;
+    int stut = 0;
+    for (size_t k = 0; k < S; k++) {
+        float base = secMed[k];
+        for (size_t i = secStart[k]; i < secStart[k + 1]; i++) {
+            float f = ft[i];
+            t += f;
+            if (excl[k]) continue;
+            v.push_back(f);
+            psum += f;
+            mx = std::max(mx, f);
+            if (f > base * STUTTER_RATIO && f - base > STUTTER_MS) {
+                if (t - lastSt > STUTTER_GAP_MS) stut++;
+                lastSt = t;
+            }
+        }
+    }
+    if (v.size() < 2) {   // 전부 메뉴로 잡히는 일은 없지만 혹시 모를 때는 전체로
+        v.assign(ft, ft + n);
+        psum = sum; mx = 0; stut = 0;
+        for (size_t i = 0; i < n; i++) mx = std::max(mx, ft[i]);
+    }
+    size_t m = v.size();
+    s.playSec = (float)(psum / 1000.0);
+    s.avgMs = (float)(psum / m);
+    s.avgFps = (float)(m * 1000.0 / psum);
     s.maxMs = mx;
-    std::vector<float> v(ft, ft + n);
+    s.stutters = stut;
     auto pct = [&](double p) {
-        size_t k = std::min(n - 1, (size_t)(p * (n - 1)));
+        size_t k = std::min(m - 1, (size_t)(p * (m - 1)));
         std::nth_element(v.begin(), v.begin() + k, v.end());
         return v[k];
     };
-    float med = pct(0.5);
     float p99 = pct(0.99);
     float p999 = pct(0.999);
     s.low1 = p99 > 0 ? 1000.f / p99 : 0;
     s.low01 = p999 > 0 ? 1000.f / p999 : 0;
-    // 끊김: 중앙값의 2.5배 이상이면서 8ms 이상 튄 프레임
-    for (size_t i = 0; i < n; i++) if (ft[i] > med * 2.5f && ft[i] - med > 8.f) s.stutters++;
     return s;
 }
 

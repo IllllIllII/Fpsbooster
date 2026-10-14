@@ -45,9 +45,12 @@ static void DrawSettings() {
            g_updState != UPD_CHECKING && g_updState != UPD_DOWNLOADING, 12.5f);
     Text(L"기록·설정 폴더", ix, y + 522, 200, 34, 13.5f, 700, C_TEXT);
     Button(ix + iw - 124, y + 524, 124, 32, L"폴더 열기", H_OPEN_FOLDER, false, true, 12.5f);
-    Text(L"작업 기록", ix, y + 572, 200, 34, 13.5f, 700, C_TEXT);
-    Button(ix + iw - 124, y + 574, 124, 32, L"기록 보기", H_OPEN_LOG, false, true, 12.5f);
-    Text(L"프레임 측정: Intel PresentMon (MIT 라이선스)", ix, y + 628, iw, 20, 11, 400, C_FAINT);
+    Text(L"작업 기록", ix, y + 568, 200, 34, 13.5f, 700, C_TEXT);
+    Button(ix + iw - 124, y + 570, 124, 32, L"기록 보기", H_OPEN_LOG, false, true, 12.5f);
+    Text(L"문제 보고", ix, y + 612, 200, 34, 13.5f, 700, C_TEXT);
+    Text(ReportAvailable() ? L"PC 사양과 기록을 개발자에게 보내요" : L"준비 중", ix + 80, y + 612, 220, 34, 11.5f, 400, C_FAINT);
+    Button(ix + iw - 124, y + 614, 124, 32, L"보고 보내기", H_REP_OPEN, false, ReportAvailable(), 12.5f);
+    Text(L"프레임 측정: Intel PresentMon (MIT 라이선스)", ix, y + 652, iw, 18, 10.5f, 400, C_FAINT);
 
     // ── 오른쪽: 오버레이 · 측정
     x = 710; w = 446;
@@ -180,6 +183,33 @@ static void DrawUpdateModal() {
     std::wstring ok = g_updState == UPD_DOWNLOADING ? L"받는 중 " + std::to_wstring(g_updProgress) + L"%"
                     : g_updState == UPD_APPLYING ? std::wstring(L"다시 시작하는 중...") : std::wstring(L"지금 업데이트");
     Button(x + 254, yb, 226, 46, ok, H_UPD_OK, true, !busy && !g_busy, 14);
+}
+
+// 문제 보고 팝업
+static const float RP_W = 660, RP_H = 580;
+static void DrawReportModal() {
+    ModalBackdrop();
+    float w = RP_W, h = RP_H, x = (BASE_W - w) / 2, y = (BASE_H - h) / 2;
+    FillRR(x, y, w, h, 16, C_CARD);
+    StrokeRR(x, y, w, h, 16, 0xFFFFFF, 1.f, 0.08f);
+    Text(L"문제 보고", x + 28, y + 22, 300, 30, 18, 700, C_TEXT);
+    Text(L"아래 내용을 개발자에게 보내요. 이름 · 컴퓨터 이름 · 사용자 폴더 경로는 지우고 보내요.", x + 28, y + 54, w - 56, 22, 12, 400, C_DIM);
+    Text(L"어떤 문제가 있었나요? (선택)", x + 28, y + 88, 300, 22, 12.5f, 700, C_TEXT);
+    FillRR(x + 28, y + 114, w - 56, 36, 8, C_CARD2);   // 메모 입력칸 (실제 입력은 윈도우 입력창)
+    float bx = x + 20, by = y + 166, bw = w - 40, bh = h - 166 - 96;
+    FillRR(bx, by, bw, bh, 10, 0x0F0F0F);
+    PushClip(bx, by + 6, bw, bh - 12);
+    Text(g_repText, bx + 16, by + 10 - g_repScroll, bw - 32, 20000, 11.5f, 400, C_DIM, 0, 0, true);
+    PopClip();
+    std::wstring st; UINT32 sc = C_DIM;
+    if (g_repState == REP_SENDING) st = L"보내는 중...";
+    else if (g_repState == REP_SENT) { st = L"보냈어요. 고마워요!"; sc = C_GREEN; }
+    else if (g_repState == REP_FAILED) { st = g_repCode == -1 ? L"1분 뒤에 다시 보낼 수 있어요" : L"보내지 못했어요 (인터넷 확인 · 코드 " + std::to_wstring(g_repCode) + L")"; sc = C_ERR; }
+    if (!st.empty()) Text(st, x + 28, y + h - 86, w - 56, 20, 12, 700, sc);
+    float yb = y + h - 62;
+    bool done = g_repState == REP_SENT;
+    Button(x + 20, yb, (w - 48) / 2, 44, done ? L"닫기" : L"취소", H_REP_CANCEL, false, g_repState != REP_SENDING, 14);
+    Button(x + 28 + (w - 48) / 2, yb, (w - 48) / 2, 44, L"보내기", H_REP_SEND, true, g_repState != REP_SENDING && !done, 14);
 }
 
 static const float LG_X = 210, LG_Y = 150, LG_W = 760, LG_H = 380;

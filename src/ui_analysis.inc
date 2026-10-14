@@ -215,8 +215,11 @@ static void DrawAnalysis() {
     auto& s = g_sessions[g_selSess];
     Text(s.exe, x + 24, y + 16, 330, 30, 19, 700, C_TEXT);
     float hx = x + 24;
+    // 통계 (보이는 구간 기준, 로딩·메뉴 구간은 뺌)
+    FrameStats st = RangeStats(g_selFt, g_selCum, g_viewA, g_viewB);
     std::wstring sub = FmtSessionTime(s.start) + L" · " + FmtDuration(s.durSec);
-    Text(sub, hx, y + 46, 240, 22, 12, 400, C_DIM);
+    if (st.playSec > 0 && st.durSec - st.playSec >= 1.f) sub += L" · 플레이 " + FmtDuration(st.playSec) + L" 기준";
+    Text(sub, hx, y + 46, TextW(sub, 12, 400) + 4, 22, 12, 400, C_DIM);
     hx += TextW(sub, 12, 400) + 10;
     if (s.boosted) { Chip(hx, y + 46, L"BOOST", C_GREEN, C_GREENSF, 1.f, 20, 10); hx += ChipW(L"BOOST", 10) + 6; }
     if (s.power >= 0) { std::wstring pn = PowerModeName(s.power); Chip(hx, y + 46, pn, C_DIM, C_CARD3, 1.f, 20, 10); hx += ChipW(pn, 10) + 6; }
@@ -224,8 +227,6 @@ static void DrawAnalysis() {
     float dw = TextW(dl, 12, 700) + 30;
     Button(x + w - 24 - dw, y + 20, dw, 30, dl, H_SESS_DEL, false, true, 12);
 
-    // 통계 (보이는 구간 기준)
-    FrameStats st = RangeStats(g_selFt, g_selCum, g_viewA, g_viewB);
     bool cmp = g_cmpSess >= 0 && !g_cmpFt.empty();
     FrameStats cs;
     if (cmp) cs = ComputeStats(g_cmpFt.data(), g_cmpFt.size());
